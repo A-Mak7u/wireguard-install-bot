@@ -1,0 +1,2 @@
+python-telegram-bot>=22.0,<23
+qrcode[pil]>=8.0,<9

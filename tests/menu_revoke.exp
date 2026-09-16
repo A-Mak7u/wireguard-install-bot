@@ -1,0 +1,12 @@
+source /repo/tests/lib.exp
+spawn /repo/wireguard-install.sh
+must "Выбери пункт \[1-6\]: "
+send "3\r"
+expect {
+    -re {(\d+)\) inter\r} { set number $expect_out(1,string) }
+    timeout { puts "\nНет inter в списке"; exit 1 }
+}
+must "Выбери клиента"
+send "$number\r"
+must "Клиент inter удалён."
+finish

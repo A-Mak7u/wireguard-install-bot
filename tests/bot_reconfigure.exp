@@ -1,0 +1,19 @@
+# Переустановка бота из меню: токен остаётся прежним, ID определяется автоматически
+source /repo/tests/lib.exp
+exec python3 /repo/tests/tg_client.py clear
+spawn /repo/wireguard-install.sh bot
+must "Выбери пункт \[1-3\]: "
+send "1\r"
+must "Токен бота: "
+send "\r"
+must "Токен подошёл, бот: @test_vpn_bot"
+must "Telegram ID: "
+# Стираем подставленный старый ID — пустой ответ включает автоопределение
+send "\025\r"
+must "нажми Enter..."
+exec python3 /repo/tests/tg_client.py start 999 Ivan ivan_test
+send "\r"
+must "Нашёл: Ivan (@ivan_test), ID 999. Это ты? \[y/n\]: "
+send "\r"
+must "Бот запущен."
+finish

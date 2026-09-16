@@ -1,0 +1,8 @@
+source /repo/tests/lib.exp
+spawn /repo/wireguard-install.sh
+must "Выбери пункт \[1-6\]: "
+send "5\r"
+must "Точно удалить WireGuard? \[y/n\]: "
+send "y\r"
+must "WireGuard удалён."
+finish

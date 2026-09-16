@@ -1,0 +1,19 @@
+# Общее для expect-сценариев
+set timeout 300
+
+# must <текст> — дождаться текста на экране, иначе провалить сценарий
+proc must {text} {
+    expect {
+        -exact $text {}
+        timeout { puts "\nТАЙМАУТ: ждали «$text»"; exit 1 }
+        eof { puts "\nСКРИПТ ЗАВЕРШИЛСЯ, а ждали «$text»"; exit 1 }
+    }
+    # readline дорисовывает строку ввода не сразу
+    sleep 0.3
+}
+
+proc finish {} {
+    expect eof
+    lassign [wait] pid spawnid os_error code
+    exit $code
+}

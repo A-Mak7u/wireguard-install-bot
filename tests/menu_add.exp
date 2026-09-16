@@ -1,0 +1,12 @@
+source /repo/tests/lib.exp
+spawn /repo/wireguard-install.sh
+must "Выбери пункт \[1-6\]: "
+send "1\r"
+must "Имя клиента: "
+send "inter\r"
+must "IPv4 клиента внутри VPN: "
+send "\r"
+must "IPv6 клиента внутри VPN: "
+send "\r"
+must "Конфиг клиента: /root/wg0-client-inter.conf"
+finish
