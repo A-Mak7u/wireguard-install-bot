@@ -125,7 +125,7 @@ silence_for(STRANGER, lambda: press(STRANGER, "delok:mama"))
 check("посторонний не может удалить ключ", "mama" in wg_clients())
 call = tap(ADMIN, "delok:mama", contains="удалён")
 check("подтверждённое удаление работает", call is not None and "mama" not in wg_clients())
-check("файл конфига удалён с сервера", not os.path.exists("/root/wg0-client-mama.conf"))
+check("файл конфига удалён с сервера", not any(os.path.exists(f"/root/{p}-client-mama.conf") for p in ("awg0", "wg0")))
 
 call = say(ADMIN, "/removeuser ghost", contains="Не удалось удалить ghost")
 check("/removeuser несуществующего — понятная ошибка", call is not None and "не найден" in text_of(call))
@@ -137,9 +137,11 @@ check("/removeuser удаляет", call is not None and "tmpuser" not in wg_cli
 call = say(ADMIN, BTN_STATUS, contains="Статус сервера")
 check(
     "статус сервера",
-    call is not None and "WireGuard: активен" in text_of(call) and f"Порт WG: {EXPECTED_PORT}/udp" in text_of(call),
+    call is not None
+    and ("WireGuard: активен" in text_of(call) or "AmneziaWG: активен" in text_of(call))
+    and (f"Порт WG: {EXPECTED_PORT}/udp" in text_of(call) or f"Порт: {EXPECTED_PORT}/udp" in text_of(call)),
 )
-call = say(ADMIN, BTN_CLIENTS, contains="Клиенты WireGuard")
+call = say(ADMIN, BTN_CLIENTS, contains="Клиенты")
 check("отчёт по клиентам", call is not None and "phone" in text_of(call))
 
 sys.exit(1 if failures else 0)

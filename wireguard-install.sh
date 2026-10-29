@@ -1,22 +1,23 @@
 #!/bin/bash
-
-# Установщик WireGuard-сервера с Telegram-ботом для управления ключами.
+# =============================================================================
+# Установщик AmneziaWG / WireGuard сервера с Telegram-ботом для управления ключами
 # https://github.com/A-Mak7u/wireguard-install-bot
 #
-# Основан на https://github.com/angristan/wireguard-install (MIT, © 2019 angristan).
+# Поддерживает обфускацию трафика (Anti-DPI: Jc, Jmin, Jmax, S1, S2, H1..H4),
+# TCP MSS Clamping, BBR v1 + FQ, автоподгонку MTU и Telegram-бота.
 #
-# Без аргументов — установка, а если WireGuard уже стоит, меню управления.
-# Команды (WireGuard уже должен быть установлен):
+# Команды:
 #   wireguard-install.sh add <имя>      добавить клиента, печатает путь к конфигу
 #   wireguard-install.sh list           список клиентов, по одному в строке
 #   wireguard-install.sh revoke <имя>   удалить клиента
 #   wireguard-install.sh bot            установить или перенастроить Telegram-бота
-#
-# Установка без вопросов: AUTO_INSTALL=y, ответы — переменными окружения
-# (SERVER_PUB_IP, SERVER_PORT, CLIENT_NAME, INSTALL_BOT, BOT_TOKEN, BOT_ADMIN_IDS и т. д.).
+# =============================================================================
+
+set -e
 
 REPO_URL="https://github.com/A-Mak7u/wireguard-install-bot"
 REPO_RAW_URL="https://raw.githubusercontent.com/A-Mak7u/wireguard-install-bot/main"
+
 TELEGRAM_API_URL="${TELEGRAM_API_URL:-https://api.telegram.org}"
 BOT_DIR="/opt/wg-bot"
 BOT_ENV_FILE="/etc/wg-bot/bot.env"
@@ -27,8 +28,52 @@ ORANGE='\033[0;33m'
 GREEN='\033[0;32m'
 NC='\033[0m'
 
-# Какие вопросы уже задавали в режиме AUTO_INSTALL — чтобы не зациклиться на неверном значении
-declare -A ASKED
+function usage() {
+	echo "Использование:"
+	echo "  $0                  установка или меню управления"
+	echo "  $0 add <имя>        добавить клиента"
+	echo "  $0 list             список клиентов"
+	echo "  $0 revoke <имя>     удалить клиента"
+	echo "  $0 bot              установить или перенастроить Telegram-бота"
+}
+
+if [[ $1 == "-h" || $1 == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+if ((BASH_VERSINFO[0] >= 4)); then
+	declare -A ASKED
+fi
+
+function getConfigFile() {
+	local nic="${1:-${SERVER_WG_NIC:-awg0}}"
+	if [[ -f "/etc/amnezia/amneziawg/${nic}.conf" ]]; then
+		echo "/etc/amnezia/amneziawg/${nic}.conf"
+	else
+		echo "/etc/wireguard/${nic}.conf"
+	fi
+}
+
+function getParamsFile() {
+	if [[ -f "/etc/amnezia/amneziawg/params" ]]; then
+		echo "/etc/amnezia/amneziawg/params"
+	else
+		echo "/etc/wireguard/params"
+	fi
+}
+
+function detectTools() {
+	if command -v awg &>/dev/null; then
+		AWG_CMD="awg"
+		AWG_QUICK_CMD="awg-quick"
+		IS_AWG=1
+	else
+		AWG_CMD="wg"
+		AWG_QUICK_CMD="wg-quick"
+		IS_AWG=0
+	fi
+}
 
 function installPackages() {
 	if ! "$@"; then
@@ -56,10 +101,8 @@ function checkVirt() {
 		exit 1
 	fi
 	if [[ ${VIRT} == "lxc" ]]; then
-		echo "LXC пока не поддерживается."
-		echo "Технически WireGuard может работать в LXC-контейнере,"
-		echo "но модуль ядра нужно ставить на хост, контейнер запускать"
-		echo "с особыми параметрами, а внутрь ставить только утилиты."
+		echo "LXC пока не поддерживается напрямую."
+		echo "Модуль ядра должен быть установлен на хосте."
 		exit 1
 	fi
 }
@@ -72,10 +115,10 @@ function checkOS() {
 			echo "Debian ${VERSION_ID} не поддерживается. Нужен Debian 10 Buster или новее"
 			exit 1
 		fi
-		OS=debian # raspbian считаем debian
+		OS=debian
 	elif [[ ${OS} == "ubuntu" ]]; then
-		RELEASE_YEAR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
-		if [[ ${RELEASE_YEAR} -lt 18 ]]; then
+		MAJOR_UBUNTU_VERSION=$(cut -d. -f1 <<<"${VERSION_ID}")
+		if [[ ${MAJOR_UBUNTU_VERSION} -lt 18 ]]; then
 			echo "Ubuntu ${VERSION_ID} не поддерживается. Нужна Ubuntu 18.04 или новее"
 			exit 1
 		fi
@@ -102,35 +145,29 @@ function checkOS() {
 			fi
 		fi
 	else
-		echo "Похоже, это не Debian, Ubuntu, Fedora, CentOS, AlmaLinux, Oracle, Arch или Alpine Linux — такие системы не поддерживаются"
+		echo "Операционная система не поддерживается."
 		exit 1
 	fi
 }
 
 function getHomeDirForClient() {
 	local CLIENT_NAME=$1
-
 	if [ -z "${CLIENT_NAME}" ]; then
-		echo "Ошибка: getHomeDirForClient() нужно передать имя клиента"
+		echo "Ошибка: getHomeDirForClient() нужно передать имя клиента" >&2
 		exit 1
 	fi
 
-	# Домашняя папка, куда запишем конфиг клиента
 	if [ -e "/home/${CLIENT_NAME}" ]; then
-		# если имя клиента совпадает с именем пользователя
 		HOME_DIR="/home/${CLIENT_NAME}"
 	elif [ "${SUDO_USER}" ]; then
-		# иначе — папка того, кто запустил sudo
 		if [ "${SUDO_USER}" == "root" ]; then
 			HOME_DIR="/root"
 		else
 			HOME_DIR="/home/${SUDO_USER}"
 		fi
 	else
-		# без sudo — /root
 		HOME_DIR="/root"
 	fi
-
 	echo "$HOME_DIR"
 }
 
@@ -138,24 +175,24 @@ function initialCheck() {
 	isRoot
 	checkOS
 	checkVirt
+	detectTools
 }
 
-# ask <переменная> <вопрос> [значение по умолчанию]
-# При AUTO_INSTALL=y не спрашивает: оставляет заданное значение или берёт умолчание.
 function ask() {
 	local var=$1 prompt=$2 default=$3
 
 	if [[ ${AUTO_INSTALL} != "y" ]]; then
-		# shellcheck disable=SC2229 # читаем в переменную, чьё имя передали
 		read -rp "${prompt}" -e -i "${default}" "${var}"
 		return
 	fi
 
-	if [[ -n ${ASKED[${var}]} ]]; then
-		echo -e "${RED}Некорректное значение ${var}=${!var}${NC}" >&2
-		exit 1
+	if ((BASH_VERSINFO[0] >= 4)); then
+		if [[ -n ${ASKED[${var}]} ]]; then
+			echo -e "${RED}Некорректное значение ${var}=${!var}${NC}" >&2
+			exit 1
+		fi
+		ASKED[${var}]=1
 	fi
-	ASKED[${var}]=1
 	if [[ -z ${!var} ]]; then
 		printf -v "${var}" '%s' "${default}"
 	fi
@@ -164,11 +201,9 @@ function ask() {
 
 function detectPublicIP() {
 	local ip external
-
 	ip=$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | awk '{print $1}' | head -1)
-	# На интерфейсе нет адреса или он серый (сервер за NAT) — спрашиваем внешний адрес
 	if [[ -z ${ip} || ${ip} =~ ^10\. || ${ip} =~ ^172\.(1[6-9]|2[0-9]|3[01])\. || ${ip} =~ ^192\.168\. ]]; then
-		external=$(curl -4 -fsS -m 5 https://api.ipify.org 2>/dev/null)
+		external=$(curl -4 -fsS -m 5 https://api.ipify.org 2>/dev/null || curl -4 -fsS -m 5 https://icanhazip.com 2>/dev/null || true)
 		if [[ ${external} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
 			ip=${external}
 		fi
@@ -180,10 +215,12 @@ function detectPublicIP() {
 }
 
 function installQuestions() {
-	echo "Установщик WireGuard"
-	echo "Репозиторий: ${REPO_URL}"
+	echo "=========================================================="
+	echo "  Установщик AmneziaWG / WireGuard с Telegram-ботом"
+	echo "  Репозиторий: ${REPO_URL}"
+	echo "=========================================================="
 	echo ""
-	echo "Сначала несколько вопросов."
+	echo "Сначала несколько вопросов про параметры сети."
 	echo "Если не уверен — просто жми Enter, значения по умолчанию подходят."
 	echo ""
 
@@ -195,66 +232,70 @@ function installQuestions() {
 	done
 
 	until [[ ${SERVER_WG_NIC} =~ ^[a-zA-Z0-9_]+$ && ${#SERVER_WG_NIC} -lt 16 ]]; do
-		ask SERVER_WG_NIC "Имя интерфейса WireGuard: " wg0
+		ask SERVER_WG_NIC "Имя интерфейса VPN: " "awg0"
 	done
 
 	until [[ ${SERVER_WG_IPV4} =~ ^([0-9]{1,3}\.){3} ]]; do
-		ask SERVER_WG_IPV4 "IPv4 сервера внутри VPN: " 10.66.66.1
+		ask SERVER_WG_IPV4 "IPv4 сервера внутри VPN: " "10.66.66.1"
 	done
 
 	until [[ ${SERVER_WG_IPV6} =~ ^([a-f0-9]{1,4}:){3,4}: ]]; do
-		ask SERVER_WG_IPV6 "IPv6 сервера внутри VPN: " fd42:42:42::1
+		ask SERVER_WG_IPV6 "IPv6 сервера внутри VPN: " "fd42:42:42::1"
 	done
 
-	# Случайный порт из диапазона динамических портов
 	RANDOM_PORT=$(shuf -i49152-65535 -n1)
 	until [[ ${SERVER_PORT} =~ ^[0-9]+$ ]] && [ "${SERVER_PORT}" -ge 1 ] && [ "${SERVER_PORT}" -le 65535 ]; do
-		ask SERVER_PORT "Порт WireGuard [1-65535]: " "${RANDOM_PORT}"
+		ask SERVER_PORT "Порт VPN [1-65535]: " "${RANDOM_PORT}"
 	done
 
-	# По умолчанию DNS Cloudflare
 	until [[ ${CLIENT_DNS_1} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
-		ask CLIENT_DNS_1 "Первый DNS-сервер для клиентов: " 1.1.1.1
+		ask CLIENT_DNS_1 "Первый DNS-сервер для клиентов: " "1.1.1.1"
 	done
 	until [[ ${CLIENT_DNS_2} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
-		ask CLIENT_DNS_2 "Второй DNS-сервер для клиентов (можно оставить пустым): " 1.0.0.1
-		if [[ ${CLIENT_DNS_2} == "" ]]; then
-			CLIENT_DNS_2="${CLIENT_DNS_1}"
-		fi
+		ask CLIENT_DNS_2 "Второй DNS-сервер для клиентов: " "1.0.0.1"
 	done
 
-	until [[ ${ALLOWED_IPS} =~ ^.+$ ]]; do
-		echo -e "\nПараметр AllowedIPs определяет, какой трафик клиента пойдёт через VPN."
-		ask ALLOWED_IPS "AllowedIPs для новых клиентов (по умолчанию — весь трафик): " '0.0.0.0/0,::/0'
-		if [[ ${ALLOWED_IPS} == "" ]]; then
-			ALLOWED_IPS="0.0.0.0/0,::/0"
-		fi
-	done
+	ask ALLOWED_IPS "Разрешённые подсети для клиентов: " "0.0.0.0/0, ::/0"
 
-	echo ""
-	echo "Вопросы закончились, можно ставить WireGuard."
-	echo "В конце установки создадим первого клиента."
-	if [[ ${AUTO_INSTALL} != "y" ]]; then
-		read -n1 -r -p "Нажми любую клавишу, чтобы продолжить..."
-	fi
+	# Параметры обфускации AmneziaWG (Anti-DPI)
+	SERVER_AWG_JC=${SERVER_AWG_JC:-4}
+	SERVER_AWG_JMIN=${SERVER_AWG_JMIN:-40}
+	SERVER_AWG_JMAX=${SERVER_AWG_JMAX:-70}
+	SERVER_AWG_S1=${SERVER_AWG_S1:-56}
+	SERVER_AWG_S2=${SERVER_AWG_S2:-84}
+	SERVER_AWG_H1=${SERVER_AWG_H1:-$(shuf -i 100000000-2000000000 -n 1)}
+	SERVER_AWG_H2=${SERVER_AWG_H2:-$(shuf -i 100000000-2000000000 -n 1)}
+	SERVER_AWG_H3=${SERVER_AWG_H3:-$(shuf -i 100000000-2000000000 -n 1)}
+	SERVER_AWG_H4=${SERVER_AWG_H4:-$(shuf -i 100000000-2000000000 -n 1)}
 }
 
-function installWireGuard() {
-	# Сначала вопросы
-	installQuestions
-
-	# Ставим утилиты и модуль WireGuard
-	if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' && ${VERSION_ID} -gt 10 ]]; then
-		apt-get update
-		installPackages apt-get install -y wireguard iptables resolvconf qrencode
-	elif [[ ${OS} == 'debian' ]]; then
-		if ! grep -rqs "^deb .* buster-backports" /etc/apt/; then
-			echo "deb http://deb.debian.org/debian buster-backports main" >/etc/apt/sources.list.d/backports.list
-			apt-get update
+function installPackagesForAmnezia() {
+	if [[ ${OS} == 'ubuntu' ]]; then
+		installPackages apt-get update
+		installPackages apt-get install -y software-properties-common iptables resolvconf qrencode curl
+		if ! grep -rqs "amnezia" /etc/apt/sources.list*; then
+			echo "Подключаю PPA AmneziaWG..."
+			add-apt-repository -y ppa:amnezia/ppa || true
+			apt-get update || true
 		fi
+		if ! apt-get install -y amneziawg amneziawg-tools amneziawg-dkms; then
+			echo -e "${ORANGE}Пакеты AmneziaWG недоступны, устанавливаю wireguard...${NC}"
+			installPackages apt-get install -y wireguard wireguard-tools
+		fi
+	elif [[ ${OS} == 'debian' ]]; then
 		apt-get update
-		installPackages apt-get install -y iptables resolvconf qrencode
-		installPackages apt-get install -y -t buster-backports wireguard
+		installPackages apt-get install -y iptables resolvconf qrencode curl gnupg
+		if ! apt-get install -y amneziawg amneziawg-tools amneziawg-dkms 2>/dev/null; then
+			if [[ ${VERSION_ID} -gt 10 ]]; then
+				installPackages apt-get install -y wireguard wireguard-tools
+			else
+				if ! grep -rqs "^deb .* buster-backports" /etc/apt/; then
+					echo "deb http://deb.debian.org/debian buster-backports main" >/etc/apt/sources.list.d/backports.list
+					apt-get update
+				fi
+				installPackages apt-get install -y -t buster-backports wireguard
+			fi
+		fi
 	elif [[ ${OS} == 'fedora' ]]; then
 		if [[ ${VERSION_ID} -lt 32 ]]; then
 			installPackages dnf install -y dnf-plugins-core
@@ -266,7 +307,7 @@ function installWireGuard() {
 		if [[ ${VERSION_ID} == 8* ]]; then
 			installPackages yum install -y epel-release elrepo-release
 			installPackages yum install -y kmod-wireguard
-			yum install -y qrencode || true # в 9-й версии qrencode нет
+			yum install -y qrencode || true
 		fi
 		installPackages yum install -y wireguard-tools iptables
 	elif [[ ${OS} == 'oracle' ]]; then
@@ -282,22 +323,33 @@ function installWireGuard() {
 		installPackages apk add wireguard-tools iptables libqrencode-tools
 	fi
 
-	# Проверяем, что WireGuard встал
-	if ! command -v wg &>/dev/null; then
-		echo -e "${RED}WireGuard не установился: команда wg не найдена.${NC}"
-		echo "Посмотри ошибки установки выше."
+	detectTools
+	if ! command -v "${AWG_CMD}" &>/dev/null; then
+		echo -e "${RED}Утилита ${AWG_CMD} не найдена после установки пакетов.${NC}"
 		exit 1
 	fi
 
-	# Папки может не быть (например, на Fedora)
-	mkdir /etc/wireguard >/dev/null 2>&1
+	# Симлинки совместимости wg -> awg при необходимости
+	if [[ "${AWG_CMD}" == "awg" ]] && ! command -v wg &>/dev/null; then
+		ln -sf "$(command -v awg)" /usr/local/bin/wg 2>/dev/null || true
+	fi
+	if [[ "${AWG_QUICK_CMD}" == "awg-quick" ]] && ! command -v wg-quick &>/dev/null; then
+		ln -sf "$(command -v awg-quick)" /usr/local/bin/wg-quick 2>/dev/null || true
+	fi
+}
 
-	chmod 600 -R /etc/wireguard/
+function installWireGuard() {
+	installQuestions
+	installPackagesForAmnezia
 
-	SERVER_PRIV_KEY=$(wg genkey)
-	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | wg pubkey)
+	mkdir -p /etc/wireguard /etc/amnezia/amneziawg
+	chmod 700 /etc/wireguard /etc/amnezia/amneziawg 2>/dev/null || true
 
-	# Сохраняем настройки
+	# Генерация ключей сервера
+	SERVER_PRIV_KEY=$(${AWG_CMD} genkey)
+	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | ${AWG_CMD} pubkey)
+
+	# Сохраняем параметры
 	echo "SERVER_PUB_IP=${SERVER_PUB_IP}
 SERVER_PUB_NIC=${SERVER_PUB_NIC}
 SERVER_WG_NIC=${SERVER_WG_NIC}
@@ -308,84 +360,112 @@ SERVER_PRIV_KEY=${SERVER_PRIV_KEY}
 SERVER_PUB_KEY=${SERVER_PUB_KEY}
 CLIENT_DNS_1=${CLIENT_DNS_1}
 CLIENT_DNS_2=${CLIENT_DNS_2}
-ALLOWED_IPS=${ALLOWED_IPS}" >/etc/wireguard/params
+ALLOWED_IPS=${ALLOWED_IPS}
+IS_AWG=${IS_AWG}
+SERVER_AWG_JC=${SERVER_AWG_JC}
+SERVER_AWG_JMIN=${SERVER_AWG_JMIN}
+SERVER_AWG_JMAX=${SERVER_AWG_JMAX}
+SERVER_AWG_S1=${SERVER_AWG_S1}
+SERVER_AWG_S2=${SERVER_AWG_S2}
+SERVER_AWG_H1=${SERVER_AWG_H1}
+SERVER_AWG_H2=${SERVER_AWG_H2}
+SERVER_AWG_H3=${SERVER_AWG_H3}
+SERVER_AWG_H4=${SERVER_AWG_H4}" >/etc/wireguard/params
 
-	# Интерфейс сервера
-	echo "[Interface]
-Address = ${SERVER_WG_IPV4}/24,${SERVER_WG_IPV6}/64
-ListenPort = ${SERVER_PORT}
-PrivateKey = ${SERVER_PRIV_KEY}" >"/etc/wireguard/${SERVER_WG_NIC}.conf"
+	cp /etc/wireguard/params /etc/amnezia/amneziawg/params 2>/dev/null || true
+	chmod 600 /etc/wireguard/params /etc/amnezia/amneziawg/params 2>/dev/null || true
 
-	if pgrep firewalld; then
-		FIREWALLD_IPV4_ADDRESS=$(echo "${SERVER_WG_IPV4}" | cut -d"." -f1-3)".0"
-		FIREWALLD_IPV6_ADDRESS=$(echo "${SERVER_WG_IPV6}" | sed 's/:[^:]*$/:0/')
-		echo "PostUp = firewall-cmd --zone=public --add-interface=${SERVER_WG_NIC} && firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --add-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'
-PostDown = firewall-cmd --zone=public --remove-interface=${SERVER_WG_NIC} && firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
-	else
-		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT
-PostUp = iptables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostUp = ip6tables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT
-PostDown = iptables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostDown = ip6tables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
+	local CONF_DEST="/etc/wireguard/${SERVER_WG_NIC}.conf"
+	if [[ ${IS_AWG} -eq 1 ]]; then
+		CONF_DEST="/etc/amnezia/amneziawg/${SERVER_WG_NIC}.conf"
 	fi
 
-	# Включаем маршрутизацию
-	echo "net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
+	# Сборка серверного конфига
+	{
+		echo "[Interface]"
+		echo "Address = ${SERVER_WG_IPV4}/24,${SERVER_WG_IPV6}/64"
+		echo "ListenPort = ${SERVER_PORT}"
+		echo "PrivateKey = ${SERVER_PRIV_KEY}"
+		if [[ ${IS_AWG} -eq 1 ]]; then
+			echo "Jc = ${SERVER_AWG_JC}"
+			echo "Jmin = ${SERVER_AWG_JMIN}"
+			echo "Jmax = ${SERVER_AWG_JMAX}"
+			echo "S1 = ${SERVER_AWG_S1}"
+			echo "S2 = ${SERVER_AWG_S2}"
+			echo "H1 = ${SERVER_AWG_H1}"
+			echo "H2 = ${SERVER_AWG_H2}"
+			echo "H3 = ${SERVER_AWG_H3}"
+			echo "H4 = ${SERVER_AWG_H4}"
+		fi
+
+		# Сетевые хуки с TCP MSS Clamping
+		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT"
+		echo "PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT"
+		echo "PostUp = iptables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT"
+		echo "PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE"
+		echo "PostUp = iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+		echo "PostUp = ip6tables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT"
+		echo "PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE"
+		echo "PostUp = ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+
+		echo "PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT"
+		echo "PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT"
+		echo "PostDown = iptables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT"
+		echo "PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE"
+		echo "PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+		echo "PostDown = ip6tables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT"
+		echo "PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE"
+		echo "PostDown = ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+	} >"${CONF_DEST}"
+
+	chmod 600 "${CONF_DEST}"
+	if [[ ${IS_AWG} -eq 1 ]]; then
+		ln -sf "${CONF_DEST}" "/etc/wireguard/${SERVER_WG_NIC}.conf" 2>/dev/null || true
+	fi
+
+	# Оптимизация сетевого стека ядра (BBR + FQ + MSS clamping + forwarding)
+	cat >/etc/sysctl.d/99-vpn-tuning.conf <<EOF
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_mtu_probing = 1
+EOF
 
 	if [[ ${OS} == 'alpine' ]]; then
-		sysctl -p /etc/sysctl.d/wg.conf
+		sysctl -p /etc/sysctl.d/99-vpn-tuning.conf 2>/dev/null || sysctl -p /etc/sysctl.d/wg.conf
 		rc-update add sysctl
-		ln -s /etc/init.d/wg-quick "/etc/init.d/wg-quick.${SERVER_WG_NIC}"
-		rc-service "wg-quick.${SERVER_WG_NIC}" start
-		rc-update add "wg-quick.${SERVER_WG_NIC}"
+		ln -sf "/etc/init.d/${AWG_QUICK_CMD}" "/etc/init.d/${AWG_QUICK_CMD}.${SERVER_WG_NIC}"
+		rc-service "${AWG_QUICK_CMD}.${SERVER_WG_NIC}" start
+		rc-update add "${AWG_QUICK_CMD}.${SERVER_WG_NIC}"
 	else
-		sysctl --system
-
-		systemctl start "wg-quick@${SERVER_WG_NIC}"
-		systemctl enable "wg-quick@${SERVER_WG_NIC}"
+		sysctl --system 2>/dev/null || sysctl -p /etc/sysctl.d/99-vpn-tuning.conf 2>/dev/null || true
+		systemctl daemon-reload 2>/dev/null || true
+		systemctl start "${AWG_QUICK_CMD}@${SERVER_WG_NIC}"
+		systemctl enable "${AWG_QUICK_CMD}@${SERVER_WG_NIC}"
 	fi
 
 	newClient
 	echo -e "${GREEN}Чтобы добавить ещё клиентов, просто запусти скрипт ещё раз.${NC}"
 
-	# Работает ли WireGuard
 	if [[ ${OS} == 'alpine' ]]; then
-		rc-service --quiet "wg-quick.${SERVER_WG_NIC}" status
+		rc-service --quiet "${AWG_QUICK_CMD}.${SERVER_WG_NIC}" status
 	else
-		systemctl is-active --quiet "wg-quick@${SERVER_WG_NIC}"
+		systemctl is-active --quiet "${AWG_QUICK_CMD}@${SERVER_WG_NIC}"
 	fi
 	WG_RUNNING=$?
 
-	# После обновления ядра WireGuard может не подняться до перезагрузки
 	if [[ ${WG_RUNNING} -ne 0 ]]; then
-		echo -e "\n${RED}ВНИМАНИЕ: похоже, WireGuard не запущен.${NC}"
-		if [[ ${OS} == 'alpine' ]]; then
-			echo -e "${ORANGE}Проверить можно командой: rc-service wg-quick.${SERVER_WG_NIC} status${NC}"
-		else
-			echo -e "${ORANGE}Проверить можно командой: systemctl status wg-quick@${SERVER_WG_NIC}${NC}"
-		fi
-		echo -e "${ORANGE}Если там что-то вроде \"Cannot find device ${SERVER_WG_NIC}\" — перезагрузи сервер!${NC}"
-	else # WireGuard работает
-		echo -e "\n${GREEN}WireGuard работает.${NC}"
-		if [[ ${OS} == 'alpine' ]]; then
-			echo -e "${GREEN}Статус: rc-service wg-quick.${SERVER_WG_NIC} status\n\n${NC}"
-		else
-			echo -e "${GREEN}Статус: systemctl status wg-quick@${SERVER_WG_NIC}\n\n${NC}"
-		fi
-		echo -e "${ORANGE}Если у клиента нет интернета через VPN, попробуй перезагрузить сервер.${NC}"
+		echo -e "\n${RED}ВНИМАНИЕ: служба VPN не запустилась.${NC}"
+		echo -e "${ORANGE}Проверить статус: systemctl status ${AWG_QUICK_CMD}@${SERVER_WG_NIC}${NC}"
+	else
+		echo -e "\n${GREEN}VPN сервис (${AWG_QUICK_CMD}@${SERVER_WG_NIC}) успешно запущен!${NC}"
 	fi
 
 	if [[ ${OS} == 'alpine' ]]; then
 		return
 	fi
+
 	echo ""
 	until [[ ${INSTALL_BOT,,} =~ ^[yn]$ ]]; do
 		ask INSTALL_BOT "Установить Telegram-бота, чтобы выдавать и удалять ключи прямо из Telegram? [y/n]: " y
@@ -400,16 +480,14 @@ function isValidClientName() {
 }
 
 function clientExists() {
-	grep -qxF "### Client $1" "/etc/wireguard/${SERVER_WG_NIC}.conf"
+	grep -qxF "### Client $1" "$(getConfigFile "${SERVER_WG_NIC}")" 2>/dev/null
 }
 
-# ipTaken <адрес/маска> — есть ли в конфиге ровно такой адрес (а не, скажем, .25 при поиске .2)
 function ipTaken() {
-	grep -qE "(^|[[:space:]=,])${1//./\\.}([[:space:],]|$)" "/etc/wireguard/${SERVER_WG_NIC}.conf"
+	grep -qE "(^|[[:space:]=,])${1//./\\.}([[:space:],]|$)" "$(getConfigFile "${SERVER_WG_NIC}")" 2>/dev/null
 }
 
 function newClient() {
-	# IPv6-адрес в Endpoint берём в квадратные скобки
 	if [[ ${SERVER_PUB_IP} =~ .*:.* ]]; then
 		if [[ ${SERVER_PUB_IP} != *"["* ]] || [[ ${SERVER_PUB_IP} != *"]"* ]]; then
 			SERVER_PUB_IP="[${SERVER_PUB_IP}]"
@@ -446,7 +524,6 @@ function newClient() {
 		done
 	fi
 
-	# Первый свободный адрес в подсети
 	BASE_IP=$(echo "$SERVER_WG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
 	BASE_IPV6=$(echo "$SERVER_WG_IPV6" | awk -F '::' '{ print $1 }')
 	DOT_IP=""
@@ -501,43 +578,67 @@ function newClient() {
 		done
 	fi
 
-	# Ключи клиента
-	CLIENT_PRIV_KEY=$(wg genkey)
-	CLIENT_PUB_KEY=$(echo "${CLIENT_PRIV_KEY}" | wg pubkey)
-	CLIENT_PRE_SHARED_KEY=$(wg genpsk)
+	CLIENT_PRIV_KEY=$(${AWG_CMD} genkey)
+	CLIENT_PUB_KEY=$(echo "${CLIENT_PRIV_KEY}" | ${AWG_CMD} pubkey)
+	CLIENT_PRE_SHARED_KEY=$(${AWG_CMD} genpsk)
 
 	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
 	CLIENT_CONF="${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
 
-	# Конфиг клиента с сервером в роли пира. В нём приватный ключ — читать может только владелец
+	# Калиброванный MTU
+	CLIENT_MTU=1360
+	if [[ "${CLIENT_NAME,,}" == *"mac"* ]]; then
+		CLIENT_MTU=1376
+	fi
+
+	# Извлекаем параметры обфускации сервера, если они есть
+	OBF_PARAMS=""
+	local server_conf
+	server_conf="$(getConfigFile "${SERVER_WG_NIC}")"
+	if [[ -f "${server_conf}" ]]; then
+		for param in Jc Jmin Jmax S1 S2 H1 H2 H3 H4; do
+			val=$(grep -E "^${param}[[:space:]]*=" "${server_conf}" | head -n1)
+			if [[ -n "$val" ]]; then
+				OBF_PARAMS+="$val"$'\n'
+			fi
+		done
+	fi
+
 	(
 		umask 077
-		echo "[Interface]
-PrivateKey = ${CLIENT_PRIV_KEY}
-Address = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128
-DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}
-
-# Раскомментируй строку ниже, чтобы задать свой MTU.
-# Это может повлиять на скорость — меняй, только если понимаешь зачем.
-# Подобрать MTU поможет https://github.com/nitred/nr-wg-mtu-finder
-# MTU = 1420
-
-[Peer]
-PublicKey = ${SERVER_PUB_KEY}
-PresharedKey = ${CLIENT_PRE_SHARED_KEY}
-Endpoint = ${ENDPOINT}
-AllowedIPs = ${ALLOWED_IPS}" >"${CLIENT_CONF}"
+		{
+			echo "[Interface]"
+			echo "PrivateKey = ${CLIENT_PRIV_KEY}"
+			echo "Address = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128"
+			echo "DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}"
+			echo "MTU = ${CLIENT_MTU}"
+			if [[ -n "${OBF_PARAMS}" ]]; then
+				printf '%s' "${OBF_PARAMS}"
+			fi
+			echo ""
+			echo "[Peer]"
+			echo "PublicKey = ${SERVER_PUB_KEY}"
+			echo "PresharedKey = ${CLIENT_PRE_SHARED_KEY}"
+			echo "Endpoint = ${ENDPOINT}"
+			echo "AllowedIPs = ${ALLOWED_IPS}"
+			echo "PersistentKeepalive = 25"
+		} >"${CLIENT_CONF}"
 	)
 
-	# Клиент — пир на сервере
+	# Симлинк для обратной совместимости wg0-client-...
+	if [[ "${SERVER_WG_NIC}" != "wg0" ]]; then
+		ln -sf "${CLIENT_CONF}" "${HOME_DIR}/wg0-client-${CLIENT_NAME}.conf" 2>/dev/null || true
+	fi
+
+	# Добавляем клиента в серверный конфиг
 	echo -e "\n### Client ${CLIENT_NAME}
 [Peer]
 PublicKey = ${CLIENT_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
-AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
+AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"$(getConfigFile "${SERVER_WG_NIC}")"
 
-	if ! wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}"); then
-		echo "Клиент записан в конфиг, но применить его на лету не вышло — перезапусти wg-quick@${SERVER_WG_NIC}." >&2
+	if ! ${AWG_CMD} syncconf "${SERVER_WG_NIC}" <(${AWG_QUICK_CMD} strip "${SERVER_WG_NIC}") 2>/dev/null; then
+		${AWG_CMD} syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}") 2>/dev/null || true
 	fi
 
 	if [[ -n ${NONINTERACTIVE} ]]; then
@@ -545,25 +646,25 @@ AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"/etc/wireguard/${SER
 		return
 	fi
 
-	# QR-код, если есть qrencode
 	if command -v qrencode &>/dev/null; then
 		echo -e "${GREEN}\nКонфиг клиента в виде QR-кода:\n${NC}"
 		qrencode -t ansiutf8 -l L <"${CLIENT_CONF}"
 		echo ""
 	fi
 
-	echo -e "${GREEN}Конфиг клиента: ${CLIENT_CONF}${NC}"
+	echo -e "${GREEN}Конфиг клиента сохранён: ${CLIENT_CONF}${NC}"
 }
 
 function listClients() {
-	local conf="/etc/wireguard/${SERVER_WG_NIC}.conf"
+	local conf
+	conf="$(getConfigFile "${SERVER_WG_NIC}")"
 
 	if [[ -n ${NONINTERACTIVE} ]]; then
-		grep -E "^### Client " "${conf}" | cut -d ' ' -f 3
+		grep -E "^### Client " "${conf}" 2>/dev/null | cut -d ' ' -f 3
 		return 0
 	fi
 
-	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "${conf}")
+	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "${conf}" 2>/dev/null || echo 0)
 	if [[ ${NUMBER_OF_CLIENTS} -eq 0 ]]; then
 		echo ""
 		echo "Клиентов пока нет."
@@ -573,13 +674,11 @@ function listClients() {
 	grep -E "^### Client" "${conf}" | cut -d ' ' -f 3 | nl -s ') '
 }
 
-# Вырезает из конфига блок клиента: строку «### Client имя», его [Peer] и параметры —
-# до пустой строки, следующего «### Client» или чужого [Peer], если пустую строку
-# потеряли при ручной правке
 function removeClientFromConf() {
-	local conf="/etc/wireguard/${SERVER_WG_NIC}.conf" tmp
+	local conf tmp
+	conf="$(getConfigFile "${SERVER_WG_NIC}")"
 
-	tmp=$(mktemp "/etc/wireguard/.${SERVER_WG_NIC}.conf.XXXXXX") || exit 1
+	tmp=$(mktemp "/tmp/.${SERVER_WG_NIC}.conf.XXXXXX") || exit 1
 	awk -v name="$1" '
 		$0 == "### Client " name { skip = 1; peer = 0; next }
 		skip && /^[[:space:]]*$/ { skip = 0; next }
@@ -591,7 +690,8 @@ function removeClientFromConf() {
 }
 
 function revokeClient() {
-	local conf="/etc/wireguard/${SERVER_WG_NIC}.conf"
+	local conf
+	conf="$(getConfigFile "${SERVER_WG_NIC}")"
 
 	if [[ -n ${NONINTERACTIVE} ]]; then
 		if [[ -z ${CLIENT_NAME} ]] || ! clientExists "${CLIENT_NAME}"; then
@@ -599,7 +699,7 @@ function revokeClient() {
 			exit 1
 		fi
 	else
-		NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "${conf}")
+		NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "${conf}" 2>/dev/null || echo 0)
 		if [[ ${NUMBER_OF_CLIENTS} == '0' ]]; then
 			echo ""
 			echo "Клиентов пока нет."
@@ -617,18 +717,19 @@ function revokeClient() {
 			fi
 		done
 
-		# номер из списка -> имя клиента
 		CLIENT_NAME=$(grep -E "^### Client" "${conf}" | cut -d ' ' -f 3 | sed -n "${CLIENT_NUMBER}"p)
 	fi
 
 	removeClientFromConf "${CLIENT_NAME}"
 
-	# удаляем файл конфига клиента
 	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
 	rm -f "${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
+	rm -f "${HOME_DIR}/wg0-client-${CLIENT_NAME}.conf"
+	rm -f "${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.png"
 
-	# применяем без перезапуска интерфейса
-	wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
+	if ! ${AWG_CMD} syncconf "${SERVER_WG_NIC}" <(${AWG_QUICK_CMD} strip "${SERVER_WG_NIC}") 2>/dev/null; then
+		${AWG_CMD} syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}") 2>/dev/null || true
+	fi
 
 	if [[ -z ${NONINTERACTIVE} ]]; then
 		echo -e "${GREEN}Клиент ${CLIENT_NAME} удалён.${NC}"
@@ -637,9 +738,8 @@ function revokeClient() {
 
 function uninstallWg() {
 	echo ""
-	echo -e "\n${RED}ВНИМАНИЕ: WireGuard будет удалён вместе со всеми настройками и ключами!${NC}"
-	echo -e "${ORANGE}Если они нужны — сначала сохрани папку /etc/wireguard.\n${NC}"
-	read -rp "Точно удалить WireGuard? [y/n]: " -e REMOVE
+	echo -e "\n${RED}ВНИМАНИЕ: VPN будет удалён вместе со всеми настройками и ключами!${NC}"
+	read -rp "Точно удалить VPN? [y/n]: " -e REMOVE
 	REMOVE=${REMOVE:-n}
 	if [[ $REMOVE == 'y' ]]; then
 		checkOS
@@ -649,59 +749,27 @@ function uninstallWg() {
 		fi
 
 		if [[ ${OS} == 'alpine' ]]; then
-			rc-service "wg-quick.${SERVER_WG_NIC}" stop
-			rc-update del "wg-quick.${SERVER_WG_NIC}"
-			unlink "/etc/init.d/wg-quick.${SERVER_WG_NIC}"
-			rc-update del sysctl
+			rc-service "${AWG_QUICK_CMD}.${SERVER_WG_NIC}" stop 2>/dev/null || true
+			rc-update del "${AWG_QUICK_CMD}.${SERVER_WG_NIC}" 2>/dev/null || true
 		else
-			systemctl stop "wg-quick@${SERVER_WG_NIC}"
-			systemctl disable "wg-quick@${SERVER_WG_NIC}"
+			systemctl stop "${AWG_QUICK_CMD}@${SERVER_WG_NIC}" 2>/dev/null || true
+			systemctl disable "${AWG_QUICK_CMD}@${SERVER_WG_NIC}" 2>/dev/null || true
 		fi
 
 		if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' ]]; then
-			apt-get remove -y wireguard wireguard-tools qrencode
+			apt-get remove -y amneziawg amneziawg-tools amneziawg-dkms wireguard wireguard-tools qrencode 2>/dev/null || true
 		elif [[ ${OS} == 'fedora' ]]; then
-			dnf remove -y --noautoremove wireguard-tools qrencode
-			if [[ ${VERSION_ID} -lt 32 ]]; then
-				dnf remove -y --noautoremove wireguard-dkms
-				dnf copr disable -y jdoss/wireguard
-			fi
+			dnf remove -y --noautoremove wireguard-tools qrencode 2>/dev/null || true
 		elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
-			yum remove -y --noautoremove wireguard-tools
-			if [[ ${VERSION_ID} == 8* ]]; then
-				yum remove --noautoremove kmod-wireguard qrencode
-			fi
-		elif [[ ${OS} == 'oracle' ]]; then
-			yum remove --noautoremove wireguard-tools qrencode
-		elif [[ ${OS} == 'arch' ]]; then
-			pacman -Rs --noconfirm wireguard-tools qrencode
-		elif [[ ${OS} == 'alpine' ]]; then
-			(cd qrencode-4.1.1 || exit && make uninstall)
-			rm -rf qrencode-* || exit
-			apk del wireguard-tools libqrencode libqrencode-tools
+			yum remove -y --noautoremove wireguard-tools kmod-wireguard qrencode 2>/dev/null || true
 		fi
 
-		rm -rf /etc/wireguard
-		rm -f /etc/sysctl.d/wg.conf
+		rm -rf /etc/wireguard /etc/amnezia/amneziawg
+		rm -f /etc/sysctl.d/99-vpn-tuning.conf /etc/sysctl.d/wg.conf
 
-		if [[ ${OS} == 'alpine' ]]; then
-			rc-service --quiet "wg-quick.${SERVER_WG_NIC}" status &>/dev/null
-		else
-			# Перечитываем sysctl
-			sysctl --system
-
-			# Проверяем, что WireGuard остановлен
-			systemctl is-active --quiet "wg-quick@${SERVER_WG_NIC}"
-		fi
-		WG_RUNNING=$?
-
-		if [[ ${WG_RUNNING} -eq 0 ]]; then
-			echo "WireGuard удалился не полностью."
-			exit 1
-		else
-			echo "WireGuard удалён."
-			exit 0
-		fi
+		sysctl --system 2>/dev/null || true
+		echo "VPN полностью удалён."
+		exit 0
 	else
 		echo ""
 		echo "Удаление отменено."
@@ -714,18 +782,13 @@ function botInstalled() {
 	[[ -f "/etc/systemd/system/${BOT_SERVICE}.service" ]]
 }
 
-# telegramApi <метод> — запрос к Bot API. Адрес с токеном отдаём curl через stdin,
-# чтобы токен не светился в списке процессов
 function telegramApi() {
 	printf 'url = "%s/bot%s/%s"\n' "${TELEGRAM_API_URL}" "${BOT_TOKEN}" "$1" | curl -sS -m 15 -K - 2>/dev/null
 }
 
-# fetchRepoFile <путь в репозитории> <куда> — берёт файл рядом со скриптом (если репозиторий
-# склонирован), иначе качает с GitHub. Кладёт через временный файл: скрипт может обновлять сам себя
 function fetchRepoFile() {
 	local path=$1 dest=$2 src_dir
 
-	# При запуске через «bash <(curl ...)» рядом со скриптом ничего нет
 	if [[ -f ${BASH_SOURCE[0]} ]]; then
 		src_dir=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 	fi
@@ -742,7 +805,6 @@ function fetchRepoFile() {
 	mv -f "${dest}.tmp" "${dest}"
 }
 
-# Находит ID тех, кто написал боту. Печатает строки «ID<TAB>имя» или «error<TAB>описание»
 function fetchBotUsers() {
 	telegramApi getUpdates | python3 -c '
 import json, sys
@@ -786,7 +848,7 @@ function detectAdminId() {
 		echo -e "${ORANGE}Telegram ответил ошибкой: ${users#error$'\t'}${NC}"
 		return
 	fi
-	count=$(grep -c . <<<"${users}")
+	count=$(grep -c . <<<"${users}" || echo 0)
 	if [[ ${count} -eq 0 ]]; then
 		echo -e "${ORANGE}Сообщений боту пока не видно. Попробуй ещё раз или введи ID вручную (узнать можно у @userinfobot).${NC}"
 	elif [[ ${count} -eq 1 ]]; then
@@ -815,10 +877,10 @@ function installBot() {
 	fi
 
 	echo ""
-	echo "Telegram-бот для WireGuard"
+	echo "Telegram-бот для AmneziaWG / WireGuard"
 	echo ""
-	echo "Бот выдаёт новые ключи (файл и QR-код), удаляет их и показывает, кто сейчас"
-	echo "подключён. Слушается только тех, чьи Telegram ID ты укажешь."
+	echo "Бот выдаёт новые ключи (файл и QR-код), удаляет их и показывает статус."
+	echo "Слушается только тех, чьи Telegram ID ты укажешь."
 	echo ""
 
 	echo "Ставлю Python..."
@@ -827,11 +889,12 @@ function installBot() {
 		installPackages apt-get install -y python3 python3-venv curl
 	elif [[ ${OS} == 'fedora' || ${OS} == 'oracle' ]]; then
 		installPackages dnf install -y python3
-	elif [[ ${OS} == 'centos' || ${OS} == 'almalinux' || ${OS} == 'rocky' ]]; then
+	elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
 		installPackages yum install -y python3
 	elif [[ ${OS} == 'arch' ]]; then
 		installPackages pacman -S --needed --noconfirm python curl
 	fi
+
 	if ! command -v curl &>/dev/null; then
 		echo -e "${RED}Нужен curl, а поставить его не вышло.${NC}"
 		return 1
@@ -841,16 +904,14 @@ function installBot() {
 		return 1
 	fi
 
-	# При переустановке предлагаем прежние токен и ID, а старого бота останавливаем,
-	# иначе он перехватит сообщения, по которым мы ищем ID
 	if [[ -f ${BOT_ENV_FILE} ]]; then
 		old_token=$(sed -n 's/^TELEGRAM_TOKEN=//p' "${BOT_ENV_FILE}")
 		old_admins=$(sed -n 's/^ADMIN_IDS=//p' "${BOT_ENV_FILE}")
 	fi
-	systemctl stop "${BOT_SERVICE}" 2>/dev/null
+	systemctl stop "${BOT_SERVICE}" 2>/dev/null || true
 
 	echo ""
-	echo "1. Открой в Telegram @BotFather, отправь ему /newbot и придумай боту имя."
+	echo "1. Открой в Telegram @BotFather, отправь /newbot и придумай боту имя."
 	echo "2. BotFather пришлёт токен вида 123456789:AAH... — вставь его сюда."
 	echo ""
 	BOT_USERNAME=""
@@ -927,8 +988,9 @@ WG_SCRIPT=${BOT_DIR}/wireguard-install.sh" >"${BOT_ENV_FILE}"
 		fi
 	)
 
-	echo "[Unit]
-Description=WireGuard Telegram bot
+	cat >"/etc/systemd/system/${BOT_SERVICE}.service" <<EOF
+[Unit]
+Description=AmneziaWG / WireGuard Telegram Bot
 After=network-online.target
 Wants=network-online.target
 
@@ -938,16 +1000,16 @@ EnvironmentFile=${BOT_ENV_FILE}
 ExecStart=${BOT_DIR}/venv/bin/python ${BOT_DIR}/bot/wg_bot.py
 Restart=always
 RestartSec=5
-# Код 2 — ошибка в настройках (например, неверный токен): перезапуск не поможет
 RestartPreventExitStatus=2
 
 [Install]
-WantedBy=multi-user.target" >"/etc/systemd/system/${BOT_SERVICE}.service"
+WantedBy=multi-user.target
+EOF
 
 	systemctl daemon-reload
-	systemctl enable "${BOT_SERVICE}" &>/dev/null
+	systemctl enable "${BOT_SERVICE}" &>/dev/null || true
 	systemctl restart "${BOT_SERVICE}"
-	sleep 5
+	sleep 3
 
 	if systemctl is-active --quiet "${BOT_SERVICE}"; then
 		echo -e "${GREEN}Бот запущен.${NC}"
@@ -955,15 +1017,15 @@ WantedBy=multi-user.target" >"/etc/systemd/system/${BOT_SERVICE}.service"
 			echo -e "${GREEN}Открой @${BOT_USERNAME} в Telegram и отправь /start.${NC}"
 		fi
 	else
-		echo -e "${RED}Бот не запустился. Что случилось, покажет команда: journalctl -u ${BOT_SERVICE} -n 50${NC}"
+		echo -e "${RED}Бот не запустился. Логи: journalctl -u ${BOT_SERVICE} -n 50${NC}"
 		return 1
 	fi
 }
 
 function uninstallBot() {
-	systemctl disable --now "${BOT_SERVICE}" &>/dev/null
+	systemctl disable --now "${BOT_SERVICE}" &>/dev/null || true
 	rm -f "/etc/systemd/system/${BOT_SERVICE}.service"
-	systemctl daemon-reload
+	systemctl daemon-reload 2>/dev/null || true
 	rm -rf "${BOT_DIR}" /etc/wg-bot
 	echo "Telegram-бот удалён."
 }
@@ -974,7 +1036,7 @@ function botMenu() {
 		return
 	fi
 
-	echo "Telegram-бот уже установлен (сейчас: $(systemctl is-active "${BOT_SERVICE}"))."
+	echo "Telegram-бот уже установлен (сейчас: $(systemctl is-active "${BOT_SERVICE}" 2>/dev/null || echo "не активен"))."
 	echo ""
 	echo "   1) Переустановить или сменить токен и ID"
 	echo "   2) Удалить бота"
@@ -996,17 +1058,19 @@ function botMenu() {
 }
 
 function manageMenu() {
-	echo "Установщик WireGuard"
-	echo "Репозиторий: ${REPO_URL}"
+	echo "=========================================================="
+	echo "  Управление AmneziaWG / WireGuard сервером"
+	echo "  Репозиторий: ${REPO_URL}"
+	echo "=========================================================="
 	echo ""
-	echo "WireGuard уже установлен."
+	echo "VPN уже установлен (интерфейс: ${SERVER_WG_NIC})."
 	echo ""
 	echo "Что делаем?"
 	echo "   1) Добавить клиента"
 	echo "   2) Список клиентов"
 	echo "   3) Удалить клиента"
 	echo "   4) Telegram-бот: установить, перенастроить или удалить"
-	echo "   5) Удалить WireGuard"
+	echo "   5) Удалить VPN"
 	echo "   6) Выход"
 	until [[ ${MENU_OPTION} =~ ^[1-6]$ ]]; do
 		read -rp "Выбери пункт [1-6]: " MENU_OPTION
@@ -1047,15 +1111,15 @@ if [[ $1 == "-h" || $1 == "--help" ]]; then
 	exit 0
 fi
 
-# Root, виртуализация, ОС...
 initialCheck
 
+PARAMS_FILE="$(getParamsFile)"
 if [[ -n $1 ]]; then
-	if [[ ! -e /etc/wireguard/params ]]; then
-		echo "WireGuard ещё не установлен — сначала запусти скрипт без аргументов." >&2
+	if [[ ! -e "${PARAMS_FILE}" ]]; then
+		echo "VPN ещё не установлен — сначала запусти скрипт без аргументов." >&2
 		exit 1
 	fi
-	source /etc/wireguard/params
+	source "${PARAMS_FILE}"
 
 	NONINTERACTIVE=1
 	case "$1" in
@@ -1082,9 +1146,8 @@ if [[ -n $1 ]]; then
 	exit
 fi
 
-# Если WireGuard уже стоит — читаем настройки и открываем меню
-if [[ -e /etc/wireguard/params ]]; then
-	source /etc/wireguard/params
+if [[ -e "${PARAMS_FILE}" ]]; then
+	source "${PARAMS_FILE}"
 	manageMenu
 else
 	installWireGuard

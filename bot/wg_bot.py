@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Telegram-бот для управления клиентами WireGuard.
+"""Telegram-бот для управления клиентами AmneziaWG / WireGuard.
 
 Ключи создаёт и удаляет wireguard-install.sh (команды add, list, revoke) —
-бот только вызывает его, присылает конфиги и показывает статус сервера.
-Настройки берутся из переменных окружения; установщик пишет их
-в /etc/wg-bot/bot.env.
+бот только вызывает его, присылает конфиги с параметрами обфускации и показывает статус сервера.
+Настройки берутся из переменных окружения; установщик пишет их в /etc/wg-bot/bot.env.
 """
 
 from __future__ import annotations
@@ -13,13 +12,14 @@ import asyncio
 import datetime
 import io
 import logging
+from logging.handlers import RotatingFileHandler
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 import qrcode
 from telegram import (
@@ -41,20 +41,26 @@ from telegram.ext import (
 
 # ========= Настройки =========
 
+log_handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+log_file = os.environ.get("LOG_FILE")
+if log_file:
+    log_handlers.append(
+        RotatingFileHandler(log_file, maxBytes=10 * 1024 * 1024, backupCount=3)
+    )
+
 logging.basicConfig(
-    stream=sys.stdout,
     level=logging.INFO,
     format="%(levelname)s %(name)s: %(message)s",
+    handlers=log_handlers,
 )
-# httpx на уровне INFO пишет в лог каждый запрос с полным адресом, а в адресе — токен бота
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("wg-bot")
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.environ.get("ADMIN_IDS", ""))}
 WG_SCRIPT = os.environ.get("WG_SCRIPT", "/opt/wg-bot/wireguard-install.sh")
 TELEGRAM_API_URL = os.environ.get("TELEGRAM_API_URL", "https://api.telegram.org").rstrip("/")
-WG_PARAMS = Path("/etc/wireguard/params")
 
 CLIENT_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,15}")
 ACTIVE_HANDSHAKE_SECONDS = 10 * 60
@@ -70,7 +76,7 @@ BTN_STATUS = "📊 Статус сервера"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
-# ========= WireGuard =========
+# ========= VPN Утилиты =========
 
 
 class ScriptError(Exception):
@@ -101,7 +107,7 @@ def run_script(*args: str) -> str:
 
 
 async def call_script(*args: str) -> str:
-    # Скрипт переписывает конфиг WireGuard — две команды одновременно пускать нельзя
+    # Скрипт переписывает конфиг VPN — две команды одновременно пускать нельзя
     global _script_lock
     if _script_lock is None:
         _script_lock = asyncio.Lock()
@@ -128,12 +134,24 @@ async def revoke_client(name: str) -> None:
 
 def read_wg_params() -> dict[str, str]:
     params = {}
-    if WG_PARAMS.exists():
-        for line in WG_PARAMS.read_text().splitlines():
-            key, sep, value = line.partition("=")
-            if sep:
-                params[key.strip()] = value.strip()
+    for p in [Path("/etc/amnezia/amneziawg/params"), Path("/etc/wireguard/params")]:
+        if p.exists():
+            for line in p.read_text().splitlines():
+                key, sep, value = line.partition("=")
+                if sep:
+                    params[key.strip()] = value.strip()
+            break
     return params
+
+
+def find_wg_config(interface: str) -> Path:
+    for p in [
+        Path(f"/etc/amnezia/amneziawg/{interface}.conf"),
+        Path(f"/etc/wireguard/{interface}.conf"),
+    ]:
+        if p.exists():
+            return p
+    return Path(f"/etc/wireguard/{interface}.conf")
 
 
 def format_bytes(num_bytes: int) -> str:
@@ -177,39 +195,47 @@ def format_age(timestamp: int) -> str:
 
 
 def format_uptime() -> str:
-    uptime_seconds = int(float(Path("/proc/uptime").read_text().split()[0]))
-    days, rem = divmod(uptime_seconds, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes, _ = divmod(rem, 60)
+    try:
+        uptime_seconds = int(float(Path("/proc/uptime").read_text().split()[0]))
+        days, rem = divmod(uptime_seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, _ = divmod(rem, 60)
 
-    parts = []
-    if days:
-        parts.append(f"{days}д")
-    if hours:
-        parts.append(f"{hours}ч")
-    if minutes or not parts:
-        parts.append(f"{minutes}м")
-    return " ".join(parts)
+        parts = []
+        if days:
+            parts.append(f"{days}д")
+        if hours:
+            parts.append(f"{hours}ч")
+        if minutes or not parts:
+            parts.append(f"{minutes}м")
+        return " ".join(parts)
+    except Exception:
+        return "неизвестно"
 
 
 def get_memory_summary() -> tuple[str, str, int]:
-    meminfo = {}
-    for line in Path("/proc/meminfo").read_text().splitlines():
-        key, value = line.split(":", 1)
-        meminfo[key] = int(value.strip().split()[0]) * 1024
+    try:
+        meminfo = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, value = line.split(":", 1)
+            meminfo[key] = int(value.strip().split()[0]) * 1024
 
-    total = meminfo["MemTotal"]
-    used = total - meminfo["MemAvailable"]
-    return format_bytes(used), format_bytes(total), round(used / total * 100)
+        total = meminfo["MemTotal"]
+        used = total - meminfo["MemAvailable"]
+        return format_bytes(used), format_bytes(total), round(used / total * 100)
+    except Exception:
+        return "0 B", "0 B", 0
 
 
 def get_disk_summary() -> tuple[str, str, int]:
-    usage = shutil.disk_usage("/")
-    return format_bytes(usage.used), format_bytes(usage.total), round(usage.used / usage.total * 100)
+    try:
+        usage = shutil.disk_usage("/")
+        return format_bytes(usage.used), format_bytes(usage.total), round(usage.used / usage.total * 100)
+    except Exception:
+        return "0 B", "0 B", 0
 
 
 def parse_peer_names(config: Path) -> dict[str, str]:
-    """Сопоставляет публичные ключи пиров с именами из строк «### Client имя»."""
     peer_names = {}
     current_client = None
     if not config.exists():
@@ -227,22 +253,44 @@ def parse_peer_names(config: Path) -> dict[str, str]:
 
 
 def get_wg_peers(interface: str) -> list[dict]:
-    peer_names = parse_peer_names(Path(f"/etc/wireguard/{interface}.conf"))
-    result = subprocess.run(
-        ["wg", "show", interface, "dump"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    config_path = find_wg_config(interface)
+    peer_names = parse_peer_names(config_path)
+
+    cmd = ["awg", "show", interface, "dump"] if shutil.which("awg") else ["wg", "show", interface, "dump"]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
 
     peers = []
-    # Первая строка — сам интерфейс, дальше по строке на пира
+    # Первая строка — сам интерфейс (в AmneziaWG имеет 30 полей).
+    # Пиры имеют 8 полей (awg show <iface> dump) или 9 полей (awg show all dump).
     for line in result.stdout.splitlines()[1:]:
         parts = line.split("\t")
         if len(parts) < 7:
             continue
-        public_key, _, endpoint, allowed_ips, handshake, rx, tx = parts[:7]
-        handshake_ts = int(handshake)
+        if len(parts) >= 8:
+            if "/" not in parts[3] and "/" not in parts[4]:
+                continue
+            if len(parts) >= 9 and "/" in parts[4]:
+                public_key, endpoint, allowed_ips, handshake, rx, tx = parts[1], parts[3], parts[4], parts[5], parts[6], parts[7]
+            else:
+                public_key, endpoint, allowed_ips, handshake, rx, tx = parts[0], parts[2], parts[3], parts[4], parts[5], parts[6]
+        else:
+            public_key, _, endpoint, allowed_ips, handshake, rx, tx = parts[:7]
+
+        try:
+            handshake_ts = int(handshake)
+            rx_bytes = int(rx)
+            tx_bytes = int(tx)
+        except ValueError:
+            continue
+
         peers.append(
             {
                 "name": peer_names.get(public_key, public_key[:12]),
@@ -250,8 +298,8 @@ def get_wg_peers(interface: str) -> list[dict]:
                 "endpoint": endpoint,
                 "handshake_ts": handshake_ts,
                 # rx — что сервер получил от клиента, tx — что отправил ему
-                "rx_bytes": int(rx),
-                "tx_bytes": int(tx),
+                "rx_bytes": rx_bytes,
+                "tx_bytes": tx_bytes,
                 "is_active": handshake_ts > 0
                 and time.time() - handshake_ts <= ACTIVE_HANDSHAKE_SECONDS,
             }
@@ -263,17 +311,32 @@ def get_wg_peers(interface: str) -> list[dict]:
 
 def build_status_report() -> str:
     params = read_wg_params()
-    interface = params.get("SERVER_WG_NIC", "wg0")
-    wg_active = (
+    interface = params.get("SERVER_WG_NIC", "awg0" if shutil.which("awg") else "wg0")
+
+    awg_active = (
         subprocess.run(
+            ["systemctl", "is-active", "--quiet", f"awg-quick@{interface}"],
+            check=False,
+        ).returncode
+        == 0
+    )
+    wg_active = (
+        awg_active
+        or subprocess.run(
             ["systemctl", "is-active", "--quiet", f"wg-quick@{interface}"],
             check=False,
         ).returncode
         == 0
     )
+    is_awg = bool(shutil.which("awg")) or "awg" in interface or params.get("IS_AWG") == "1"
+    vpn_label = "AmneziaWG" if is_awg else "WireGuard"
+
     peers = get_wg_peers(interface) if wg_active else []
     active_peers = [p for p in peers if p["is_active"]]
-    load1, load5, load15 = os.getloadavg()
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except Exception:
+        load1, load5, load15 = 0.0, 0.0, 0.0
     mem_used, mem_total, mem_percent = get_memory_summary()
     disk_used, disk_total, disk_percent = get_disk_summary()
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -281,7 +344,7 @@ def build_status_report() -> str:
     return "\n".join(
         [
             f"📊 Статус сервера ({now})",
-            f"{'🟢' if wg_active else '🔴'} WireGuard: {'активен' if wg_active else 'не активен'}",
+            f"{'🟢' if wg_active else '🔴'} {vpn_label}: {'активен' if wg_active else 'не активен'}",
             f"👥 Клиенты: {len(active_peers)} активны / {len(peers)} всего",
             f"📥 Клиенты скачали: {format_bytes(sum(p['tx_bytes'] for p in peers))}",
             f"📤 Клиенты отправили: {format_bytes(sum(p['rx_bytes'] for p in peers))}",
@@ -296,12 +359,16 @@ def build_status_report() -> str:
 
 def build_clients_report() -> str:
     params = read_wg_params()
-    peers = get_wg_peers(params.get("SERVER_WG_NIC", "wg0"))
+    interface = params.get("SERVER_WG_NIC", "awg0" if shutil.which("awg") else "wg0")
+    is_awg = bool(shutil.which("awg")) or "awg" in interface or params.get("IS_AWG") == "1"
+    vpn_label = "AmneziaWG" if is_awg else "WireGuard"
+
+    peers = get_wg_peers(interface)
     active_peers = [p for p in peers if p["is_active"]]
     lines = [
-        "👥 Клиенты WireGuard",
+        f"👥 Клиенты {vpn_label}",
         f"🟢 Активны за последние 10 минут: {len(active_peers)} / {len(peers)}",
-        "ℹ️ Трафик считается с последнего запуска WireGuard.",
+        f"ℹ️ Трафик считается с последнего запуска {vpn_label}.",
         "",
     ]
     if not peers:
@@ -346,19 +413,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     context.user_data.pop("mode", None)
-    await update.message.reply_text("Панель управления WireGuard.", reply_markup=admin_keyboard())
+    await update.message.reply_text("Панель управления AmneziaWG / WireGuard.", reply_markup=admin_keyboard())
 
 
 async def send_client_config(message: Message, name: str, path: Path) -> None:
     config = path.read_bytes()
-    # Имя файла становится именем туннеля в приложении WireGuard, а там лимит 15 символов
     await message.reply_document(
         document=config,
         filename=f"{name}.conf",
-        caption="Файл для приложения WireGuard: «Добавить туннель» → «Импорт из файла».",
+        caption="Файл для приложения AmneziaWG: «Добавить туннель» → «Импорт из файла».",
     )
     await message.reply_photo(
-        photo=make_qr_png(config.decode()),
+        photo=make_qr_png(config.decode(errors="ignore")),
         caption=f"QR-код для {name}: «Добавить туннель» → «Сканировать QR-код».",
     )
 
@@ -480,7 +546,7 @@ async def on_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except ScriptError as exc:
             await query.edit_message_text(f"❌ Не удалось удалить {name}: {exc}")
             return
-        await query.edit_message_text(f"✅ Ключ {name} удалён.")
+        await query.edit_message_text(f"🗑 Ключ {name} удалён.")
 
 
 async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
