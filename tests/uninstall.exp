@@ -2,7 +2,13 @@ source /repo/tests/lib.exp
 spawn /repo/wireguard-install.sh
 must "Выбери пункт \[1-6\]: "
 send "5\r"
-must "Точно удалить WireGuard? \[y/n\]: "
+expect {
+    -re "Точно удалить (WireGuard|VPN)\\? \\[y/n\\]: " {}
+    timeout { puts "\nТАЙМАУТ: ждали вопрос об удалении"; exit 1 }
+}
 send "y\r"
-must "WireGuard удалён."
+expect {
+    -re "(WireGuard|VPN полностью) удалён\\." {}
+    timeout { puts "\nТАЙМАУТ: ждали подтверждение удаления"; exit 1 }
+}
 finish

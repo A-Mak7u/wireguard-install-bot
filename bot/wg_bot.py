@@ -241,7 +241,12 @@ def parse_peer_names(config: Path) -> dict[str, str]:
     if not config.exists():
         return peer_names
 
-    for raw_line in config.read_text().splitlines():
+    try:
+        content = config.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return peer_names
+
+    for raw_line in content.splitlines():
         line = raw_line.strip()
         if line.startswith("### Client "):
             current_client = line[len("### Client "):].strip()
@@ -275,9 +280,9 @@ def get_wg_peers(interface: str) -> list[dict]:
         if len(parts) < 7:
             continue
         if len(parts) >= 8:
-            if "/" not in parts[3] and "/" not in parts[4]:
+            if parts[3] != "(none)" and parts[4] != "(none)" and "/" not in parts[3] and "/" not in parts[4]:
                 continue
-            if len(parts) >= 9 and "/" in parts[4]:
+            if len(parts) >= 9 and ("/" in parts[4] or parts[4] == "(none)"):
                 public_key, endpoint, allowed_ips, handshake, rx, tx = parts[1], parts[3], parts[4], parts[5], parts[6], parts[7]
             else:
                 public_key, endpoint, allowed_ips, handshake, rx, tx = parts[0], parts[2], parts[3], parts[4], parts[5], parts[6]
@@ -313,21 +318,26 @@ def build_status_report() -> str:
     params = read_wg_params()
     interface = params.get("SERVER_WG_NIC", "awg0" if shutil.which("awg") else "wg0")
 
-    awg_active = (
-        subprocess.run(
-            ["systemctl", "is-active", "--quiet", f"awg-quick@{interface}"],
-            check=False,
-        ).returncode
-        == 0
-    )
-    wg_active = (
-        awg_active
-        or subprocess.run(
-            ["systemctl", "is-active", "--quiet", f"wg-quick@{interface}"],
-            check=False,
-        ).returncode
-        == 0
-    )
+    try:
+        awg_active = (
+            subprocess.run(
+                ["systemctl", "is-active", "--quiet", f"awg-quick@{interface}"],
+                check=False,
+            ).returncode
+            == 0
+        )
+        wg_active = (
+            awg_active
+            or subprocess.run(
+                ["systemctl", "is-active", "--quiet", f"wg-quick@{interface}"],
+                check=False,
+            ).returncode
+            == 0
+        )
+    except FileNotFoundError:
+        awg_active = subprocess.run(["awg", "show", interface], capture_output=True).returncode == 0 if shutil.which("awg") else False
+        wg_active = awg_active or (subprocess.run(["wg", "show", interface], capture_output=True).returncode == 0 if shutil.which("wg") else False)
+
     is_awg = bool(shutil.which("awg")) or "awg" in interface or params.get("IS_AWG") == "1"
     vpn_label = "AmneziaWG" if is_awg else "WireGuard"
 
@@ -458,6 +468,24 @@ async def create_client(message: Message, name: str) -> None:
     await message.reply_text(f"✅ Ключ {name} создан и отправлен.", reply_markup=admin_keyboard())
 
 
+async def send_long_text(message: Message, text: str, reply_markup=None) -> None:
+    max_len = 4000
+    if len(text) <= max_len:
+        await message.reply_text(text, reply_markup=reply_markup)
+        return
+
+    lines = text.splitlines(keepends=True)
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) > max_len:
+            if chunk:
+                await message.reply_text(chunk.rstrip())
+                chunk = ""
+        chunk += line
+    if chunk:
+        await message.reply_text(chunk.rstrip(), reply_markup=reply_markup)
+
+
 async def show_clients_list(message: Message) -> None:
     try:
         clients = await list_clients()
@@ -469,7 +497,7 @@ async def show_clients_list(message: Message) -> None:
         await message.reply_text("Клиентов нет.", reply_markup=admin_keyboard())
         return
     body = "\n".join(f"{i}) {name}" for i, name in enumerate(clients, 1))
-    await message.reply_text("📜 Список клиентов:\n" + body, reply_markup=admin_keyboard())
+    await send_long_text(message, "📜 Список клиентов:\n" + body, reply_markup=admin_keyboard())
 
 
 async def ask_which_to_delete(message: Message) -> None:
@@ -492,7 +520,7 @@ async def send_report(message: Message, build_report) -> None:
     except Exception as exc:
         log.exception("Не удалось собрать отчёт")
         report = f"❌ Ошибка: {exc}"
-    await message.reply_text(report, reply_markup=admin_keyboard())
+    await send_long_text(message, report, reply_markup=admin_keyboard())
 
 
 async def on_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -65,7 +65,7 @@ docker exec -d "${SERVER}" python3 /repo/tests/fake_telegram.py
 until on_server 'python3 /repo/tests/tg_client.py clear' &>/dev/null; do sleep 0.5; done
 
 section "Установка без вопросов: WireGuard + бот"
-if ! on_server "AUTO_INSTALL=y SERVER_PUB_IP=${SERVER_IP} SERVER_PORT=${PORT} CLIENT_NAME=phone \
+if ! on_server "AUTO_INSTALL=y SERVER_PUB_IP=${SERVER_IP} SERVER_PORT=${PORT} CLIENT_NAME=phone SERVER_WG_NIC=wg0 \
 	INSTALL_BOT=y BOT_TOKEN=${TOKEN} BOT_ADMIN_IDS=555 TELEGRAM_API_URL=http://127.0.0.1:8081 \
 	/repo/wireguard-install.sh" >"${LOGS}/install.log" 2>&1; then
 	echo "FAIL установщик завершился с ошибкой, хвост лога:"

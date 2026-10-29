@@ -202,7 +202,7 @@ function ask() {
 function detectPublicIP() {
 	local ip external
 	ip=$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | awk '{print $1}' | head -1)
-	if [[ -z ${ip} || ${ip} =~ ^10\. || ${ip} =~ ^172\.(1[6-9]|2[0-9]|3[01])\. || ${ip} =~ ^192\.168\. ]]; then
+	if [[ -z ${ip} || ${ip} =~ ^10\. || ${ip} =~ ^172\.(1[6-9]|2[0-9]|3[01])\. || ${ip} =~ ^192\.168\. || ${ip} =~ ^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\. || ${ip} =~ ^169\.254\. || ${ip} =~ ^127\. ]]; then
 		external=$(curl -4 -fsS -m 5 https://api.ipify.org 2>/dev/null || curl -4 -fsS -m 5 https://icanhazip.com 2>/dev/null || true)
 		if [[ ${external} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
 			ip=${external}
@@ -586,7 +586,7 @@ function newClient() {
 	CLIENT_CONF="${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
 
 	# Калиброванный MTU
-	CLIENT_MTU=1360
+	CLIENT_MTU=${CLIENT_MTU:-1360}
 	if [[ "${CLIENT_NAME,,}" == *"mac"* ]]; then
 		CLIENT_MTU=1376
 	fi
@@ -664,7 +664,8 @@ function listClients() {
 		return 0
 	fi
 
-	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "${conf}" 2>/dev/null || echo 0)
+	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "${conf}" 2>/dev/null || true)
+	NUMBER_OF_CLIENTS=${NUMBER_OF_CLIENTS:-0}
 	if [[ ${NUMBER_OF_CLIENTS} -eq 0 ]]; then
 		echo ""
 		echo "Клиентов пока нет."
@@ -699,8 +700,9 @@ function revokeClient() {
 			exit 1
 		fi
 	else
-		NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "${conf}" 2>/dev/null || echo 0)
-		if [[ ${NUMBER_OF_CLIENTS} == '0' ]]; then
+		NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "${conf}" 2>/dev/null || true)
+		NUMBER_OF_CLIENTS=${NUMBER_OF_CLIENTS:-0}
+		if [[ ${NUMBER_OF_CLIENTS} -eq 0 ]]; then
 			echo ""
 			echo "Клиентов пока нет."
 			exit 1
@@ -797,6 +799,8 @@ function fetchRepoFile() {
 			return 0
 		fi
 		cp "${src_dir}/${path}" "${dest}.tmp"
+	elif [[ ${path} == *"wireguard-install.sh"* && -n ${src_dir} && -f "${src_dir}/amneziawg-install.sh" ]]; then
+		cp "${src_dir}/amneziawg-install.sh" "${dest}.tmp"
 	elif ! curl -fsSL "${REPO_RAW_URL}/${path}" -o "${dest}.tmp"; then
 		rm -f "${dest}.tmp"
 		echo -e "${RED}Не удалось скачать ${REPO_RAW_URL}/${path}${NC}"
@@ -848,7 +852,12 @@ function detectAdminId() {
 		echo -e "${ORANGE}Telegram ответил ошибкой: ${users#error$'\t'}${NC}"
 		return
 	fi
-	count=$(grep -c . <<<"${users}" || echo 0)
+	if [[ -z ${users} ]]; then
+		count=0
+	else
+		count=$(grep -c . <<<"${users}" || true)
+		count=${count:-0}
+	fi
 	if [[ ${count} -eq 0 ]]; then
 		echo -e "${ORANGE}Сообщений боту пока не видно. Попробуй ещё раз или введи ID вручную (узнать можно у @userinfobot).${NC}"
 	elif [[ ${count} -eq 1 ]]; then
@@ -1096,20 +1105,6 @@ function manageMenu() {
 		;;
 	esac
 }
-
-function usage() {
-	echo "Использование:"
-	echo "  $0                  установка или меню управления"
-	echo "  $0 add <имя>        добавить клиента"
-	echo "  $0 list             список клиентов"
-	echo "  $0 revoke <имя>     удалить клиента"
-	echo "  $0 bot              установить или перенастроить Telegram-бота"
-}
-
-if [[ $1 == "-h" || $1 == "--help" ]]; then
-	usage
-	exit 0
-fi
 
 initialCheck
 
