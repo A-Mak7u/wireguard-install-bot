@@ -417,13 +417,16 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
+        return
     if user.id not in ADMIN_IDS:
         log.warning("Бота открыл посторонний: id=%s username=%s", user.id, user.username)
-        await update.message.reply_text(f"Доступ только для админа. Твой Telegram ID: {user.id}")
+        await message.reply_text(f"Доступ только для админа. Твой Telegram ID: {user.id}")
         return
 
     context.user_data.pop("mode", None)
-    await update.message.reply_text("Панель управления AmneziaWG / WireGuard.", reply_markup=admin_keyboard())
+    await message.reply_text("Панель управления AmneziaWG / WireGuard.", reply_markup=admin_keyboard())
 
 
 async def send_client_config(message: Message, name: str, path: Path) -> None:
@@ -525,7 +528,9 @@ async def send_report(message: Message, build_report) -> None:
 
 async def on_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Кнопки меню и ввод имени клиента после «Добавить ключ»."""
-    message = update.message
+    message = update.effective_message
+    if message is None:
+        return
     text = (message.text or "").strip()
     waiting_for_name = context.user_data.pop("mode", None) == "await_client_name"
 
@@ -578,7 +583,9 @@ async def on_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.message
+    message = update.effective_message
+    if message is None:
+        return
     if not context.args:
         await message.reply_text("Использование: /removeuser <имя_клиента>", reply_markup=admin_keyboard())
         return

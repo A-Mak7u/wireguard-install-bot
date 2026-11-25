@@ -272,19 +272,29 @@ function installQuestions() {
 function installPackagesForAmnezia() {
 	if [[ ${OS} == 'ubuntu' ]]; then
 		installPackages apt-get update
-		installPackages apt-get install -y software-properties-common iptables resolvconf qrencode curl
+		installPackages apt-get install -y software-properties-common iptables qrencode curl
+		if apt-cache show resolvconf &>/dev/null && ! systemctl is-active --quiet systemd-resolved; then
+			apt-get install -y resolvconf || true
+		fi
 		if ! grep -rqs "amnezia" /etc/apt/sources.list*; then
 			echo "Подключаю PPA AmneziaWG..."
-			add-apt-repository -y ppa:amnezia/ppa || true
+			add-apt-repository -y ppa:amnezia/ppa || echo -e "${ORANGE}Не удалось подключить PPA AmneziaWG.${NC}" >&2
 			apt-get update || true
 		fi
 		if ! apt-get install -y amneziawg amneziawg-tools amneziawg-dkms; then
-			echo -e "${ORANGE}Пакеты AmneziaWG недоступны, устанавливаю wireguard...${NC}"
+			if [[ ${FORCE_AWG:-n} == "y" ]]; then
+				echo -e "${RED}Не удалось установить AmneziaWG (FORCE_AWG=y).${NC}" >&2
+				exit 1
+			fi
+			echo -e "${ORANGE}ВНИМАНИЕ: пакеты AmneziaWG недоступны, ставлю обычный wireguard БЕЗ обфускации Anti-DPI!${NC}" >&2
 			installPackages apt-get install -y wireguard wireguard-tools
 		fi
 	elif [[ ${OS} == 'debian' ]]; then
 		apt-get update
-		installPackages apt-get install -y iptables resolvconf qrencode curl gnupg
+		installPackages apt-get install -y iptables qrencode curl gnupg
+		if apt-cache show resolvconf &>/dev/null && ! systemctl is-active --quiet systemd-resolved; then
+			apt-get install -y resolvconf || true
+		fi
 		if ! apt-get install -y amneziawg amneziawg-tools amneziawg-dkms 2>/dev/null; then
 			if [[ ${VERSION_ID} -gt 10 ]]; then
 				installPackages apt-get install -y wireguard wireguard-tools
@@ -379,6 +389,8 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >/etc/wireguard/params
 	if [[ ${IS_AWG} -eq 1 ]]; then
 		CONF_DEST="/etc/amnezia/amneziawg/${SERVER_WG_NIC}.conf"
 	fi
+	local SUBNET_V4="${SERVER_WG_IPV4%.*}.0/24"
+	local SUBNET_V6="${SERVER_WG_IPV6%%::*}::/64"
 
 	# Сборка серверного конфига
 	{
@@ -398,23 +410,23 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >/etc/wireguard/params
 			echo "H4 = ${SERVER_AWG_H4}"
 		fi
 
-		# Сетевые хуки с TCP MSS Clamping
+		# Сетевые хуки с TCP MSS Clamping (NAT ограничен подсетью VPN)
 		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT"
 		echo "PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT"
 		echo "PostUp = iptables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT"
-		echo "PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE"
+		echo "PostUp = iptables -t nat -A POSTROUTING -s ${SUBNET_V4} -o ${SERVER_PUB_NIC} -j MASQUERADE"
 		echo "PostUp = iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
 		echo "PostUp = ip6tables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT"
-		echo "PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE"
+		echo "PostUp = ip6tables -t nat -A POSTROUTING -s ${SUBNET_V6} -o ${SERVER_PUB_NIC} -j MASQUERADE"
 		echo "PostUp = ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
 
 		echo "PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT"
 		echo "PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT"
 		echo "PostDown = iptables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT"
-		echo "PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE"
+		echo "PostDown = iptables -t nat -D POSTROUTING -s ${SUBNET_V4} -o ${SERVER_PUB_NIC} -j MASQUERADE"
 		echo "PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
 		echo "PostDown = ip6tables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT"
-		echo "PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE"
+		echo "PostDown = ip6tables -t nat -D POSTROUTING -s ${SUBNET_V6} -o ${SERVER_PUB_NIC} -j MASQUERADE"
 		echo "PostDown = ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
 	} >"${CONF_DEST}"
 
@@ -485,6 +497,17 @@ function clientExists() {
 
 function ipTaken() {
 	grep -qE "(^|[[:space:]=,])${1//./\\.}([[:space:],]|$)" "$(getConfigFile "${SERVER_WG_NIC}")" 2>/dev/null
+}
+
+function syncConfig() {
+	local conf
+	conf="$(getConfigFile "${SERVER_WG_NIC}")"
+	if ! ${AWG_CMD} syncconf "${SERVER_WG_NIC}" <(${AWG_QUICK_CMD} strip "${conf}") 2>/dev/null; then
+		if ! ${AWG_CMD} syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${conf}") 2>/dev/null; then
+			echo -e "${ORANGE}Предупреждение: syncconf не сработал, перезапускаю ${AWG_QUICK_CMD}@${SERVER_WG_NIC}.${NC}" >&2
+			systemctl restart "${AWG_QUICK_CMD}@${SERVER_WG_NIC}" 2>/dev/null || true
+		fi
+	fi
 }
 
 function newClient() {
@@ -637,9 +660,7 @@ PublicKey = ${CLIENT_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"$(getConfigFile "${SERVER_WG_NIC}")"
 
-	if ! ${AWG_CMD} syncconf "${SERVER_WG_NIC}" <(${AWG_QUICK_CMD} strip "${SERVER_WG_NIC}") 2>/dev/null; then
-		${AWG_CMD} syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}") 2>/dev/null || true
-	fi
+	syncConfig
 
 	if [[ -n ${NONINTERACTIVE} ]]; then
 		echo "${CLIENT_CONF}"
@@ -729,9 +750,7 @@ function revokeClient() {
 	rm -f "${HOME_DIR}/wg0-client-${CLIENT_NAME}.conf"
 	rm -f "${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.png"
 
-	if ! ${AWG_CMD} syncconf "${SERVER_WG_NIC}" <(${AWG_QUICK_CMD} strip "${SERVER_WG_NIC}") 2>/dev/null; then
-		${AWG_CMD} syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}") 2>/dev/null || true
-	fi
+	syncConfig
 
 	if [[ -z ${NONINTERACTIVE} ]]; then
 		echo -e "${GREEN}Клиент ${CLIENT_NAME} удалён.${NC}"
@@ -768,6 +787,8 @@ function uninstallWg() {
 
 		rm -rf /etc/wireguard /etc/amnezia/amneziawg
 		rm -f /etc/sysctl.d/99-vpn-tuning.conf /etc/sysctl.d/wg.conf
+		[[ -L /usr/local/bin/wg ]] && rm -f /usr/local/bin/wg
+		[[ -L /usr/local/bin/wg-quick ]] && rm -f /usr/local/bin/wg-quick
 
 		sysctl --system 2>/dev/null || true
 		echo "VPN полностью удалён."
@@ -878,7 +899,7 @@ function detectAdminId() {
 }
 
 function installBot() {
-	local old_token="" old_admins="" check
+	local old_token="" old_admins="" check="" BOT_TOKEN_DONE=""
 
 	if ! command -v systemctl &>/dev/null || [[ ${OS} == 'alpine' ]]; then
 		echo -e "${RED}Бота можно поставить только на систему с systemd.${NC}"
