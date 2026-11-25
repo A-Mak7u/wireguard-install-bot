@@ -139,7 +139,7 @@ def read_wg_params() -> dict[str, str]:
             for line in p.read_text().splitlines():
                 key, sep, value = line.partition("=")
                 if sep:
-                    params[key.strip()] = value.strip()
+                    params[key.strip()] = value.strip().strip("'\"")
             break
     return params
 
